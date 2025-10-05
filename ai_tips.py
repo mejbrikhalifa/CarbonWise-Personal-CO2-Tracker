@@ -3,13 +3,35 @@ import os
 from dotenv import load_dotenv
 import time
 from functools import lru_cache
-from openai import OpenAI, OpenAIError
+from openai import OpenAIError
 
 import random
 import re
-# Create client (safe even if key is missing; we guard before calling)
-load_dotenv()  # Load variables from .env if present
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Optional .env loading and Streamlit secrets; create client lazily to avoid import-time failures
+try:
+    load_dotenv()
+except Exception:
+    pass
+import streamlit as st
+
+def get_openai_key() -> str | None:
+    """Return OpenAI key from env or Streamlit secrets (if set)."""
+    return os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+
+_client = None
+def get_openai_client():
+    """Create and cache the OpenAI client lazily. Returns None if no key."""
+    global _client
+    if _client is not None:
+        return _client
+    key = get_openai_key()
+    if not key:
+        return None
+    # Local import to avoid hard failure if package missing until actually needed
+    from openai import OpenAI
+    _client = OpenAI(api_key=key)
+    return _client
 
 # Public flag for UI to inspect last tip source: "gpt" | "fallback" | "unknown"
 LAST_TIP_SOURCE = "unknown"
@@ -305,7 +327,7 @@ def generate_eco_tip(user_data: dict, emissions: float) -> str:
     if not _has_meaningful_inputs(safe_inputs):
         LAST_TIP_SOURCE = "fallback"
         return clean_tip(_generic_tip_or_clarify())
-    if not os.getenv("OPENAI_API_KEY"):
+    if not get_openai_key():
         print("⚠️ OPENAI_API_KEY not set. Using local tip generator.")
         LAST_TIP_SOURCE = "fallback"
         return clean_tip(local_tip(safe_inputs, emissions))
@@ -361,6 +383,9 @@ def _gpt_tip_from_prompt(prompt: str) -> str:
     # Simulation flag (for stress/end-to-end testing): force fallbacks
     if os.environ.get("SIMULATE_API_FAILURES"):
         return ""    
+    client = get_openai_client()
+    if client is None:
+        return ""
     retries = 3
     base_delay = 1.0
     for attempt in range(retries):
@@ -463,7 +488,7 @@ def generate_eco_tip_with_prompt(
     )
     prompt = _build_prompt_variant(float(emissions or 0), structured_context, mode=mode, category=category)
 
-    if not os.getenv("OPENAI_API_KEY"):
+    if not get_openai_key():
         tip = local_tip(safe_inputs, emissions)
         return clean_tip(tip), prompt + "\n\n(Note: Fallback used; no API key)"
 
@@ -535,13 +560,13 @@ def local_tip(user_data: dict, emissions: float) -> str:
         return f"{preface} Biggest source: {best_key.replace('_', ' ')}. Tip: {tips_by_key[best_key]}"
 
     # Otherwise choose a general practical tip based on broad categories
-    energy_load = sum((float(safe_inputs.get(k, 0) or 0)) * LOCAL_CO2_FACTORS.get(k, 0) for k in [
+    energy_load = sum((float(user_data.get(k, 0) or 0)) * LOCAL_CO2_FACTORS.get(k, 0) for k in [
         "electricity_kwh", "natural_gas_m3", "district_heating_kwh", "propane_liter", "fuel_oil_liter"
     ])
-    transport_load = sum((float(safe_inputs.get(k, 0) or 0)) * LOCAL_CO2_FACTORS.get(k, 0) for k in [
+    transport_load = sum((float(user_data.get(k, 0) or 0)) * LOCAL_CO2_FACTORS.get(k, 0) for k in [
         "petrol_liter", "diesel_liter", "bus_km", "train_km", "flight_short_km", "flight_long_km"
     ])
-    meals_load = sum((float(safe_inputs.get(k, 0) or 0)) * LOCAL_CO2_FACTORS.get(k, 0) for k in [
+    meals_load = sum((float(user_data.get(k, 0) or 0)) * LOCAL_CO2_FACTORS.get(k, 0) for k in [
         "meat_kg", "chicken_kg", "dairy_kg", "eggs_kg"
     ])
 
@@ -608,7 +633,7 @@ def generate_ai_summary(
             parts.append(f"{b['dominant_cat']} led today ({b['dominant_pct']:.1f}%).")
         return " ".join(parts)
 
-    if not os.getenv("OPENAI_API_KEY"):
+    if not get_openai_key():
         return _fallback_summary()
 
     b = _compute_breakdowns(safe_inputs, float(emissions or 0))
@@ -639,6 +664,9 @@ def generate_ai_summary(
         """.strip()
     ).format(structured=structured)
 
+    client = get_openai_client()
+    if client is None:
+        return _fallback_summary()
     retries = 3
     base_delay = 1.0
     for attempt in range(retries):
